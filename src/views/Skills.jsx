@@ -48,3 +48,5 @@ export default function Skills({ troops, user, appId }) {
                 ))}
             </div>
         </div>
+    );
+}
