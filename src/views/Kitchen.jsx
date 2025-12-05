@@ -42,3 +42,7 @@ export default function Kitchen({ troops, inventory, user, appId }) {
                         </div>
                     );
                 })}
+            </div>
+        </div>
+    );
+}
