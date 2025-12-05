@@ -10,7 +10,7 @@ import { TAVERN_REFRESH_MS, LEVEL_XP_CURVE, COOKING_XP_CURVE, MAX_LEVEL, MAX_COO
 // Component Imports
 import AuthScreen from './components/AuthScreen';
 import Navbar from './components/Navbar';
-// Assumes views are in src/views/
+import Header from './components/Header';
 import Barracks from './views/Barracks';
 import CharacterSheet from './views/CharacterSheet';
 import Tavern from './views/Tavern';
@@ -38,9 +38,11 @@ export default function App() {
     const [showNameModal, setShowNameModal] = useState(false);
     const [newName, setNewName] = useState("");
 
+    // Refs to avoid stale closures in loops
     const troopsRef = useRef(troops);
     const inventoryRef = useRef(inventory);
     const gameStateRef = useRef(gameState);
+    const processingResult = useRef(false); // Prevents double victory triggers
 
     useEffect(() => { troopsRef.current = troops; }, [troops]);
     useEffect(() => { inventoryRef.current = inventory; }, [inventory]);
@@ -90,12 +92,17 @@ export default function App() {
     // --- Listeners ---
     useEffect(() => {
         if (!user) return;
+        
+        // TROOPS LISTENER
         const unsubTroops = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, 'troops'), (snap) => {
-            if (gameStateRef.current === 'fighting') return; 
+            // Important: Don't update local state during combat to prevent rubber-banding health
+            if (gameStateRef.current === 'fighting') return;
             const t = [];
             snap.forEach(doc => t.push({ ...doc.data(), uid: doc.id }));
             setTroops(t);
         });
+
+        // PROFILE LISTENER
         const unsubProfile = onSnapshot(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'data'), (snap) => {
             if (snap.exists()) {
                 setInventory(snap.data().inventory || []);
@@ -110,17 +117,27 @@ export default function App() {
                 setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'data'), { inventory: [], gold: 100 });
             }
         });
+
+        // COMBAT STATE LISTENER
         const unsubBattle = onSnapshot(doc(db, 'artifacts', appId, 'users', user.uid, 'system', 'combat'), (snap) => {
             if (snap.exists()) {
                 const data = snap.data();
                 if (data.active) {
+                    // Restore state from DB so we can resume fighting
                     setEnemies(data.enemies);
+                    if (data.troopIds) setSelectedTroops(data.troopIds); // Restore selection for auto-battle
                     setGameState('fighting');
-                } else if (gameStateRef.current === 'fighting') {
-                    setGameState('victory');
+                    processingResult.current = false; // Reset lock
+                } else {
+                    if (gameStateRef.current === 'fighting') {
+                        // DB says fight is over, update local UI
+                        setGameState('victory'); 
+                        processingResult.current = false;
+                    }
                 }
             }
         });
+
         const unsubTavern = onSnapshot(doc(db, 'artifacts', appId, 'users', user.uid, 'system', 'tavern'), (snap) => {
             if (snap.exists()) setTavernState(snap.data());
             else {
@@ -128,14 +145,15 @@ export default function App() {
                 setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'system', 'tavern'), { recruits: newRecruits, nextRefresh: Date.now() + TAVERN_REFRESH_MS });
             }
         });
+
         const heartbeat = setInterval(() => {
             updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'data'), { lastOnline: Date.now() }).catch(()=>{});
         }, 10000);
+
         return () => { unsubTroops(); unsubProfile(); unsubTavern(); unsubBattle(); clearInterval(heartbeat); };
     }, [user]);
 
-    // --- Loops (Regen, Cooking, Combat) go here --- 
-    // (Ensure you copy the UseEffect loops from the previous single-file code into here)
+    // --- Loops (Regen, Cooking) ---
     
     // Regen
     useEffect(() => {
@@ -196,27 +214,86 @@ export default function App() {
         return () => clearInterval(cookingInterval);
     }, [user]);
 
-    // Combat Loop (Local Calc)
+    // --- COMBAT LOGIC ---
+
+    const setupAndStartMission = async () => {
+        // Use troopsRef to make sure we have latest data
+        const currentTroops = troopsRef.current;
+        // Ensure selectedTroops contains valid IDs (filtering out any that might have died)
+        const validSelectedIds = selectedTroops.filter(id => currentTroops.find(t => t.uid === id));
+        
+        if (validSelectedIds.length === 0) { 
+            setAutoBattle(false); 
+            setCombatLog(p => [...p, "Auto-battle stopped: No valid troops."]);
+            return; 
+        }
+        
+        // 1. Mark troops as inCombat
+        const updates = validSelectedIds.map(uid => 
+            updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'troops', uid), { 
+                inCombat: true, 
+                actionGauge: 0, 
+                battleKills: 0,
+                combatHitCount: 0,
+                combatAttackCount: 0
+            })
+        );
+        await Promise.all(updates);
+
+        // 2. Create Combat Session
+        const enemyCount = Math.floor(Math.random() * 4) + 1;
+        const newEnemies = Array.from({ length: enemyCount }, (_, i) => ({
+            id: `blob_${i}`, name: `Bloblin ${i+1}`, maxHp: 40, currentHp: 40, ap: 8, def: 0, spd: 8, actionGauge: Math.random() * 50
+        }));
+        
+        const battleData = {
+            active: true,
+            enemies: newEnemies,
+            troopIds: validSelectedIds, // Save IDs so we can resume if refreshed
+            log: ["Combat Started!"],
+            tick: 0
+        };
+
+        await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'system', 'combat'), battleData);
+        
+        // 3. Update Local State immediately
+        setEnemies(newEnemies);
+        setGameState('fighting');
+        processingResult.current = false; // Reset lock
+        setView('combat');
+    };
+
+    // COMBAT LOOP
     useEffect(() => {
         if (gameState !== 'fighting') return;
+        
         const interval = setInterval(() => {
+            if (processingResult.current) return; // Don't tick if we are ending the fight
+
             const combatRef = doc(db, 'artifacts', appId, 'users', user.uid, 'system', 'combat');
             let logUpdates = [];
             let battleOver = false;
             let dirtyTroops = new Map();
+            
+            // Filter troops that are marked as inCombat in local state
             const fighters = troopsRef.current.filter(t => t.inCombat);
+            
+            // Safety: If logic breaks and no fighters, abort
             if (fighters.length === 0 && enemies.length > 0) return;
 
+            // Tick
             [...fighters, ...enemies].forEach(u => {
                 if (u.currentHp > 0) u.actionGauge = (u.actionGauge || 0) + (u.baseStats?.spd || u.spd || 8);
             });
 
+            // Act
             const actors = [...fighters, ...enemies].filter(u => u.currentHp > 0 && u.actionGauge >= 100).sort((a, b) => b.actionGauge - a.actionGauge);
             
             actors.forEach(actor => {
                 if (battleOver || actor.currentHp <= 0) return;
                 actor.actionGauge -= 100;
                 const isPlayer = !!actor.uid;
+                
                 const targets = isPlayer ? enemies.filter(e => e.currentHp > 0) : fighters.filter(t => t.currentHp > 0);
                 if (targets.length === 0) { battleOver = true; return; }
                 const target = targets[Math.floor(Math.random() * targets.length)];
@@ -232,6 +309,7 @@ export default function App() {
                 
                 let rawDmg = (stats.ap * dmgMod * (0.8 + Math.random() * 0.4)) - (targetStats.def || 0);
                 let finalDmg = Math.max(1, Math.floor(rawDmg));
+                
                 target.currentHp -= finalDmg;
                 logUpdates.push(`${actor.name} hits ${target.name} for ${finalDmg}`);
 
@@ -252,36 +330,97 @@ export default function App() {
                 if (target.uid) dirtyTroops.set(target.uid, target);
             });
 
-            setEnemies([...enemies]);
-            setCombatLog(prev => [...prev, ...logUpdates].slice(-10));
+            // Update UI
+            setEnemies([...enemies]); 
+            if (logUpdates.length > 0) setCombatLog(prev => [...prev, ...logUpdates].slice(-10));
+            
+            // Sync to DB
             updateDoc(combatRef, { enemies: enemies, active: !battleOver }).catch(()=>{});
             dirtyTroops.forEach(t => {
                 updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'troops', t.uid), { 
-                    currentHp: t.currentHp, actionGauge: t.actionGauge, battleKills: t.battleKills || 0, combatHitCount: t.combatHitCount || 0, combatAttackCount: t.combatAttackCount || 0
+                    currentHp: t.currentHp, 
+                    actionGauge: t.actionGauge,
+                    battleKills: t.battleKills || 0,
+                    combatHitCount: t.combatHitCount || 0,
+                    combatAttackCount: t.combatAttackCount || 0
                 }).catch(()=>{});
             });
 
+            // Win/Loss Condition
             const aliveTroops = fighters.filter(t => t.currentHp > 0);
             const aliveEnemies = enemies.filter(e => e.currentHp > 0);
-            if (aliveTroops.length === 0) { 
-                // Defeat logic... (You would extract handleDefeat to pass here or simplify)
-                setGameState('defeat');
-                setAutoBattle(false);
-                updateDoc(combatRef, { active: false });
-                Promise.all(fighters.map(u => deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'troops', u.uid))));
-                battleOver = true; 
-            } 
-            else if (aliveEnemies.length === 0) { 
-                // Victory logic...
-                setGameState('victory');
-                setCombatLog(prev => [...prev, "VICTORY! Found Rewards."]);
-                // (XP Logic would go here - simplified for brevity in this view)
-                updateDoc(combatRef, { active: false });
-                battleOver = true; 
+            
+            if (battleOver || aliveTroops.length === 0 || aliveEnemies.length === 0) {
+                // Prevent double execution
+                if (!processingResult.current) {
+                    processingResult.current = true; // LOCK
+                    if (aliveTroops.length === 0) handleDefeat(fighters);
+                    else handleVictory(fighters);
+                }
             }
         }, 800);
         return () => clearInterval(interval);
     }, [gameState, enemies]);
+
+    // --- Auto Battle Trigger ---
+    useEffect(() => {
+        if (gameState === 'victory' && autoBattle) {
+            const timer = setTimeout(() => { 
+                if (view === 'combat' && autoBattle) {
+                    setupAndStartMission(); 
+                }
+            }, 2500);
+            return () => clearTimeout(timer);
+        }
+    }, [gameState, autoBattle, view]);
+
+    // --- Result Handlers ---
+    const handleVictory = async (survivors) => {
+        setGameState('victory');
+        setCombatLog(prev => [...prev, "VICTORY! Found Rewards."]);
+        const xpGain = 20;
+        let newInv = [...inventoryRef.current];
+        
+        let dropChance = 0.1;
+        const hasGloves = survivors.some(t => t.equipment?.gloves?.name === 'Slimey Gloves');
+        if (hasGloves) dropChance *= 2; 
+        
+        if (Math.random() < dropChance) newInv.push({ id: generateId(), name: "Slime Paste", type: 'resource', desc: "Sticky. Cookable." });
+        if (Math.random() < 0.05) newInv.push({ id: generateId(), name: "Slimey Gloves", type: 'gloves', stats: { def: 1 }, desc: "Sticky. Good for cooking." });
+        if (Math.random() < 0.3) newInv.push({ id: generateId(), name: "Dull Sword", type: 'weapon', stats: { ap: 2, maxHp: -5 } });
+
+        const updates = survivors.map(async (unit) => {
+            if (unit.currentHp <= 0) return deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'troops', unit.uid));
+            
+            let newXp = (unit.xp || 0) + xpGain;
+            let newLevel = unit.level;
+            if (newLevel < MAX_LEVEL && newXp >= LEVEL_XP_CURVE[newLevel]) newLevel++;
+            
+            const effectiveStats = getEffectiveStats({ ...unit, level: newLevel });
+            const currentLore = unit.lore || { missionsWon: 0, kills: 0, closeCalls: 0 };
+            const isCloseCall = (unit.currentHp / effectiveStats.maxHp) <= 0.05;
+            const newLore = { 
+                missionsWon: (currentLore.missionsWon || 0) + 1, 
+                kills: (currentLore.kills || 0) + (unit.battleKills || 0), 
+                closeCalls: (currentLore.closeCalls || 0) + (isCloseCall ? 1 : 0) 
+            };
+            
+            await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'troops', unit.uid), { 
+                xp: newXp, level: newLevel, lore: newLore, inCombat: false, actionGauge: 0 
+            });
+        });
+        
+        await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'data'), { gold: gold + 15, inventory: newInv });
+        await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'system', 'combat'), { active: false });
+        await Promise.all(updates);
+    };
+
+    const handleDefeat = async (party) => {
+        setGameState('defeat');
+        setAutoBattle(false);
+        await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'system', 'combat'), { active: false });
+        await Promise.all(party.map(u => deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'troops', u.uid))));
+    };
 
     if (!user) return <AuthScreen />;
 
@@ -289,15 +428,7 @@ export default function App() {
 
     return (
         <div className="h-full w-full bg-slate-900 text-slate-100 font-sans selection:bg-amber-900 pb-20 overflow-y-auto">
-            <header className="bg-slate-800 border-b border-slate-700 p-3 sticky top-0 z-20 flex justify-between items-center shadow-md">
-                <div className="flex items-center gap-2 text-amber-500"><Shield className="fill-current w-5 h-5" /><span className="font-bold tracking-wider">IRON & OIL</span></div>
-                <div className="flex gap-4 items-center text-sm font-mono">
-                    <span className="text-slate-400 text-xs">Lvl {playerLevel}</span>
-                    <span className="text-yellow-400">🪙 {gold}</span>
-                    <span className="text-blue-300 flex items-center gap-1"><Backpack size={14}/> {inventory.length}</span>
-                    <button onClick={() => signOut(auth)} className="text-slate-500 hover:text-red-400 ml-2"><LogOut size={16} /></button>
-                </div>
-            </header>
+            <Header playerLevel={playerLevel} gold={gold} inventoryCount={inventory.length} />
 
             {showNameModal && (
                 <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
