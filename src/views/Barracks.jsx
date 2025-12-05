@@ -45,3 +45,5 @@ export default function Barracks({ troops, profile, maxTroops, setView, setSelec
                 })}
             </div>
         </div>
+    );
+}
